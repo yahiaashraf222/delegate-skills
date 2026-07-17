@@ -1,0 +1,36 @@
+{
+  "name": "delegate-skills",
+  "id": "delegate-skills",
+  "owner": {
+    "name": "yahiaashraf222",
+    "url": "https://github.com/yahiaashraf222"
+  },
+  "metadata": {
+    "description": "Delegate coding work to a separate CLI agent (Codex, OpenCode, Antigravity, Grok, Kimi) and land it yourself.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "delegate-skills",
+      "source": "./",
+      "description": "Drive Codex, OpenCode, Antigravity, Grok, or Kimi as a background implementer — brief it, review its diff, land the commit yourself.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Ahmed Mohammed (amElnagdy)",
+        "url": "https://github.com/amElnagdy/delegate-skills"
+      },
+      "license": "MIT",
+      "keywords": [
+        "delegation",
+        "codex",
+        "opencode",
+        "antigravity",
+        "grok",
+        "kimi",
+        "code-review",
+        "workflow"
+      ],
+      "category": "workflow"
+    }
+  ]
+}

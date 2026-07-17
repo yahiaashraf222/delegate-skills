@@ -1,0 +1,27 @@
+{
+  "name": "delegate-skills",
+  "description": "Drive Codex, OpenCode, Antigravity, Grok, or Kimi as a background implementer — brief it, review its diff, land the commit yourself.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Ahmed Mohammed (amElnagdy)",
+    "url": "https://github.com/amElnagdy/delegate-skills"
+  },
+  "license": "MIT",
+  "keywords": [
+    "delegation",
+    "codex",
+    "opencode",
+    "antigravity",
+    "grok",
+    "kimi",
+    "code-review",
+    "workflow"
+  ],
+  "skills": [
+    "./skills/codex-delegate",
+    "./skills/opencode-delegate",
+    "./skills/agy-delegate",
+    "./skills/grok-delegate",
+    "./skills/kimi-delegate"
+  ]
+}
