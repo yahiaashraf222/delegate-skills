@@ -65,8 +65,9 @@
 import { spawn, execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
-import { constants, tmpdir } from "node:os";
+import { constants, homedir, tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_TIMEOUT = "30m";
 
@@ -162,6 +163,33 @@ function kimiVersion() {
     if (err && err.code === "ENOENT") return null;
     return "unknown";
   }
+}
+
+const KIMI_COMMAND_CANDIDATES = ["kimi", "kimi-cli"];
+
+export function makeKimiEnv(baseEnv = process.env) {
+  return {
+    ...baseEnv,
+    PYTHONUTF8: "1",
+    PYTHONIOENCODING: "utf-8",
+  };
+}
+
+function defaultVersionProbe(command, env) {
+  return execFileSync(command, ["--version"], { encoding: "utf8", env }).trim();
+}
+
+export function resolveKimiCommand(probe = defaultVersionProbe, baseEnv = process.env) {
+  const env = makeKimiEnv(baseEnv);
+  for (const command of KIMI_COMMAND_CANDIDATES) {
+    try {
+      const version = probe(command, env);
+      if (version) return { command, version, env };
+    } catch {
+      // Try the next supported command name.
+    }
+  }
+  return null;
 }
 
 function parseDuration(duration) {
@@ -452,4 +480,5 @@ function printSummary(result, resultPath) {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-main();
+const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;
+if (invokedPath === import.meta.url) main();
