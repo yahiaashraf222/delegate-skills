@@ -10,3 +10,6 @@ node_modules/
 
 # local agent config symlink (see AGENTS.md)
 CLAUDE.md
+
+# isolated feature worktrees
+.worktrees/
