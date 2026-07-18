@@ -23,22 +23,28 @@ The loop needs only a shell command and file access, so any comparable orchestra
 ## When NOT to use this
 
 - The task is small enough to do inline; delegation overhead is not worth it.
-- The `kimi` CLI is not installed or authenticated.
+- The `kimi` CLI is not installed or authenticated (the relay probes `kimi`, then `kimi-cli`).
 - You need a CLI-enforced read-only implementer. Headless Kimi has no read-only mode.
 
 ## Prerequisites (check once)
 
-1. Install Kimi Code with `brew install kimi-code` on macOS/Linux, or use the native installer from
-   the [official Kimi Code documentation](https://moonshotai.github.io/kimi-code/en/).
-2. Authenticate with `kimi login` (device-code flow, no TUI), or use `/login` in the TUI.
-3. Confirm `kimi --version` succeeds.
+1. Install Kimi Code using the recommended install script or npm instructions in the
+   [official getting-started guide](https://moonshotai.github.io/kimi-code/en/guides/getting-started).
+2. Authenticate with `kimi login` or `kimi-cli login` (device-code flow, no TUI), or use `/login` in the TUI.
+3. Confirm `kimi --version` or `kimi-cli --version` succeeds.
 4. Work in, or point `--cd` at, the target git repository.
+
+The relay probes `kimi` first and falls back to `kimi-cli`; either command may satisfy the prerequisite.
+It forces UTF-8 for the child process on every platform while preserving the caller's environment.
 
 ## Choose the model alias
 
 Kimi uses `default_model` from its `config.toml` when `--model` is omitted. To choose another model
 alias, pass `--model <alias from your kimi config>`. Model aliases are user-defined config keys; use
-one the human has configured rather than inventing one.
+one the human has configured rather than inventing one. When `--model` is supplied, the relay
+validates the exact alias before dispatch using `$KIMI_CODE_HOME/config.toml`, then
+`~/.kimi-code/config.toml`, then legacy `~/.kimi/config.toml`; an unknown alias exits 2 before any
+run starts. Omitting `--model` keeps Kimi's configured default.
 
 ## The loop
 
@@ -59,23 +65,28 @@ and writes `result.json`. (`<skill-dir>` is the installed folder containing this
 ```bash
 node "<skill-dir>/scripts/relay.mjs" --brief brief.txt --cd /path/to/repo
 # choose a configured model alias:       add --model <alias from your kimi config>
+# liveness heartbeat every 30s (default): add --heartbeat 30s
+# disable the heartbeat:                 add --heartbeat 0
 # resume the most recent session:        add --resume-last  (delta brief only)
 # resume a specific session:             add --session <id> (delta brief only)
 # see all options:                       node .../relay.mjs --help
 ```
 
 The child process's cwd pins the workspace. Use repeatable `--add-dir` flags only for extra workspace
-directories. The relay writes artifacts under the system temp dir by default and never commits. See
+directories. Use `--heartbeat <duration>` to control liveness output (`30s` by default); pass
+`--heartbeat 0` to disable it. Heartbeats and progress lines show that the child remains active. The
+relay writes artifacts under the system temp dir by default and never commits. See
 [references/dispatch-and-poll.md](references/dispatch-and-poll.md).
 
 ### 3. Wait for completion
 
 The helper blocks until Kimi finishes. Run it with the orchestrator's background-command facility, or
 background it in the shell and poll for `result.json`. A pre-run usage error exits 2 and writes no
-result; a missing `kimi` exits 127 and writes `status: "kimi_unavailable"`.
+result; if neither `kimi` nor `kimi-cli` is executable the relay exits 127 and writes
+`status: "kimi_unavailable"`.
 
-Trust process state and the working tree over a progress display. Completion means the process exited
-and `result.json` exists.
+Completion still requires the process to exit and `result.json` to contain a status. Trust process
+state and the working tree over a progress display.
 
 ### 4. Review - do not trust the self-report
 
@@ -96,9 +107,9 @@ then review again.
 
 ## Autonomy and permissions
 
-In headless `-p` mode, Kimi always runs in **auto permission mode** and never asks for approval. Kimi
-rejects `--prompt` combined with `--yolo`, `--auto`, or `--plan`, so the relay passes none of them and
-offers no `--read-only` or `--full-access` option. There is no CLI-enforced read-only mode: inspect
+In headless `--print` mode, Kimi always runs in **auto permission mode** and never asks for
+approval, so the relay passes no additional autonomy flag and offers no `--read-only` or
+`--full-access` option. There is no CLI-enforced read-only mode: inspect
 `touchedFiles` and the diff after every run. That diff, not a flag, is the guarantee of what changed.
 
 ## Authorization model

@@ -2,11 +2,16 @@
 /**
  * delegate-skills · kimi-delegate · relay.mjs
  *
- * Dispatch a self-contained brief to the Kimi Code CLI (`kimi -p`), capture
- * the run, and write a structured result the orchestrating agent can review.
- * The orchestrator runs this one command and reads the result JSON - every
- * Kimi-specific mechanic lives in here, which keeps the skill
- * orchestrator-agnostic. Verified against kimi CLI 0.24.0 on macOS.
+ * Dispatch a self-contained brief to the Kimi Code CLI (`kimi --print`),
+ * capture the run, and write a structured result the orchestrating agent can
+ * review. The orchestrator runs this one command and reads the result JSON -
+ * every Kimi-specific mechanic lives in here, which keeps the skill
+ * orchestrator-agnostic.
+ *
+ * The relay probes `kimi` first and falls back to `kimi-cli`; either command
+ * may satisfy the prerequisite. It forces UTF-8 for the child process on
+ * every platform (PYTHONUTF8=1, PYTHONIOENCODING=utf-8) while preserving the
+ * caller's environment.
  *
  * Trust posture: relay.mjs itself makes no network calls, reads or writes no
  * credentials, and sends no telemetry; it has no dependencies (Node built-ins
@@ -22,14 +27,10 @@
  * It deliberately does NOT commit. Committing is always the orchestrator's job
  * - after it reviews the diff and re-runs the project gates.
  *
- * Headless `-p` mode always uses Kimi's auto permission mode. Kimi rejects
- * `--yolo`, `--auto`, and `--plan` when combined with `--prompt`, so this relay
- * passes no autonomy flags and offers no read-only mode. The diff reported in
- * `touchedFiles`, not a flag, is the guarantee of what changed.
- *
- * Kimi's supported Homebrew and official-installer distributions provide a
- * native binary on every platform. The npm-installed `kimi` on Windows is a
- * `.cmd` shim this relay does not launch; use the native install there.
+ * Headless `--print` mode always uses Kimi's auto permission mode and never
+ * asks for approval, so this relay passes no additional autonomy flag and
+ * offers no read-only mode. The diff reported in `touchedFiles`, not a flag,
+ * is the guarantee of what changed.
  *
  * Usage:
  *   node relay.mjs --brief <file> [options]
@@ -39,24 +40,30 @@
  *   --brief <file>          Path to the brief. If omitted, read it from stdin.
  *   --cd <dir>              Working root for Kimi (default: current directory).
  *   --model <alias>         Kimi model alias (default: Kimi's own default_model).
+ *                           An explicit alias is validated against the first
+ *                           discovered config.toml before dispatch.
  *   --session <id>          Resume a specific Kimi session; send only the delta brief.
  *   --resume-last           Resume the most recent Kimi session for this cwd;
  *                           send only the delta brief.
  *   --add-dir <dir>         Add an extra workspace directory. Repeatable.
  *   --timeout <dur>         Relay-side watchdog (default: 30m). Kimi has no
  *                           timeout flag; durations use h/m/s strings.
+ *   --heartbeat <dur>       Liveness heartbeat on stderr (default: 30s); pass
+ *                           0 to disable. It never resets or extends --timeout.
  *   --out-dir <dir>         Where to write run artifacts (default: a fresh dir
  *                           under the system temp dir).
  *   -h, --help              Show this help.
  *
  * Result: written to <out-dir>/result.json and summarized on stdout -
- *   status, exitCode, signal, kimiVersion, sessionId, finalMessage (Kimi's own
- *   report), touchedFiles (git porcelain, null if git cannot report), and paths
- *   to brief.txt, final.txt, events.jsonl, and stderr.txt.
+ *   status, exitCode, signal, kimiVersion, kimiCommand, sessionId,
+ *   finalMessage (Kimi's own report), touchedFiles (git porcelain, null if
+ *   git cannot report), and paths to brief.txt, final.txt, events.jsonl, and
+ *   stderr.txt.
  *
  * Exit codes: a pre-run usage error (bad/missing args, empty brief) exits 2
- * before any run and writes no result file; a missing `kimi` binary exits 127;
- * otherwise the exit code mirrors Kimi's own (0 success, non-zero failure). If
+ * before any run and writes no result file; if neither `kimi` nor `kimi-cli`
+ * is executable the relay exits 127; otherwise the exit code mirrors Kimi's
+ * own (0 success, non-zero failure). If
  * the child dies on a signal, the exit code is 128 plus the signal number and
  * `result.json` records the signal. Once the brief validates, `result.json` is
  * written on every outcome - completed, failed, or kimi_unavailable.
@@ -65,10 +72,12 @@
 import { spawn, execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
-import { constants, tmpdir } from "node:os";
+import { constants, homedir, tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_TIMEOUT = "30m";
+const DEFAULT_HEARTBEAT = "30s";
 
 function fail(message, code = 2) {
   process.stderr.write(`relay: ${message}\n`);
@@ -84,6 +93,7 @@ function parseArgs(argv) {
     resumeLast: false,
     addDirs: [],
     timeout: DEFAULT_TIMEOUT,
+    heartbeat: DEFAULT_HEARTBEAT,
     outDir: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -107,6 +117,7 @@ function parseArgs(argv) {
       case "--resume-last": opts.resumeLast = true; break;
       case "--add-dir": opts.addDirs.push(next()); break;
       case "--timeout": opts.timeout = next(); break;
+      case "--heartbeat": opts.heartbeat = next(); break;
       case "--out-dir": opts.outDir = resolve(next()); break;
       default:
         fail(`unknown option: ${arg}`);
@@ -123,6 +134,9 @@ function parseArgs(argv) {
   // --timeout must fail loudly here - a silent 30m fallback would be wrong.
   if (parseDuration(opts.timeout) === null) {
     fail(`--timeout "${opts.timeout}" is not a duration; use h/m/s strings like 30m, 90s, or 1h30m`);
+  }
+  if (parseHeartbeatDuration(opts.heartbeat) === null) {
+    fail(`--heartbeat "${opts.heartbeat}" is not a duration; use 30s, 2m, or 0 to disable it`);
   }
   return opts;
 }
@@ -152,16 +166,151 @@ function readBrief(opts) {
   return stdin;
 }
 
-function kimiVersion() {
-  try {
-    const out = execFileSync("kimi", ["--version"], { encoding: "utf8" }).trim();
-    return out || "unknown";
-  } catch (err) {
-    // Only a missing binary means "unavailable"; any other version-probe
-    // failure must not masquerade as exit 127.
-    if (err && err.code === "ENOENT") return null;
-    return "unknown";
+const KIMI_COMMAND_CANDIDATES = ["kimi", "kimi-cli"];
+
+export function makeKimiEnv(baseEnv = process.env) {
+  return {
+    ...baseEnv,
+    PYTHONUTF8: "1",
+    PYTHONIOENCODING: "utf-8",
+  };
+}
+
+function defaultVersionProbe(command, env) {
+  return execFileSync(command, ["--version"], { encoding: "utf8", env }).trim();
+}
+
+export function resolveKimiCommand(probe = defaultVersionProbe, baseEnv = process.env) {
+  const env = makeKimiEnv(baseEnv);
+  for (const command of KIMI_COMMAND_CANDIDATES) {
+    try {
+      const version = probe(command, env);
+      if (version) return { command, version, env };
+    } catch {
+      // Try the next supported command name.
+    }
   }
+  return null;
+}
+
+export function kimiConfigCandidates(env = process.env, home = homedir()) {
+  const paths = [];
+  if (env.KIMI_CODE_HOME) paths.push(join(env.KIMI_CODE_HOME, "config.toml"));
+  paths.push(join(home, ".kimi-code", "config.toml"));
+  paths.push(join(home, ".kimi", "config.toml"));
+  return [...new Set(paths)];
+}
+
+export function findKimiConfig(env = process.env, home = homedir(), fileExists = existsSync) {
+  return kimiConfigCandidates(env, home).find((path) => fileExists(path)) ?? null;
+}
+
+export function parseModelAliases(toml) {
+  const aliases = [];
+  const table = /^\s*\[models\.(?:"((?:\\.|[^"\\])*)"|([A-Za-z0-9_-]+))\]\s*(?:#.*)?$/gm;
+  for (const match of toml.matchAll(table)) aliases.push(match[1] ?? match[2]);
+  return aliases;
+}
+
+export function validateModelAlias(alias, {
+  env = process.env,
+  home = homedir(),
+  readFile = readFileSync,
+  fileExists = existsSync,
+} = {}) {
+  const configPath = findKimiConfig(env, home, fileExists);
+  if (!configPath) {
+    throw new Error(`cannot validate model alias "${alias}": no Kimi config.toml found`);
+  }
+  const aliases = parseModelAliases(readFile(configPath, "utf8"));
+  if (!aliases.includes(alias)) {
+    const choices = aliases.length ? aliases.join(", ") : "(none found)";
+    throw new Error(`model alias "${alias}" is not configured in ${configPath}; available aliases: ${choices}`);
+  }
+  return { configPath, aliases };
+}
+
+export function parseHeartbeatDuration(value) {
+  if (value === "0") return 0;
+  return parseDuration(value);
+}
+
+function compactDuration(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes ? `${minutes}m${remainder ? `${remainder}s` : ""}` : `${remainder}s`;
+}
+
+function sanitizeLabel(value) {
+  // Progress metadata must stay single-line and bounded: keep only printable
+  // non-space ASCII so a malformed stream event cannot inject newlines,
+  // control characters, or unbounded text into progress output.
+  return String(value ?? "").replace(/[^\x21-\x7E]/g, "").slice(0, 40);
+}
+
+export function eventCategory(event) {
+  const role = (typeof event?.role === "string" && sanitizeLabel(event.role)) || "event";
+  const raw = typeof event?.type === "string"
+    ? event.type
+    : typeof event?.name === "string" ? event.name : null;
+  const detail = raw === null ? "" : sanitizeLabel(raw);
+  return detail ? `${role}/${detail}` : role;
+}
+
+export function formatHeartbeat({ elapsedMs, pid, eventCount, idleMs, lastCategory }) {
+  const last = (lastCategory && sanitizeLabel(lastCategory)) || "none";
+  return `relay: heartbeat elapsed=${compactDuration(elapsedMs)} pid=${pid ?? "?"} events=${eventCount} idle=${compactDuration(idleMs)} last=${last}\n`;
+}
+
+export function createProgressReporter({
+  heartbeatMs,
+  pid,
+  write = (line) => process.stderr.write(line),
+  now = Date.now,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+}) {
+  const startedAt = now();
+  let lastActivityAt = startedAt;
+  let lastProgressAt = Number.NEGATIVE_INFINITY;
+  let lastCategory = null;
+  let eventCount = 0;
+  let stopped = false;
+  const timer = heartbeatMs > 0 ? setIntervalFn(() => {
+    const current = now();
+    write(formatHeartbeat({
+      elapsedMs: current - startedAt,
+      pid,
+      eventCount,
+      idleMs: current - lastActivityAt,
+      lastCategory,
+    }));
+  }, heartbeatMs) : null;
+
+  return {
+    activity(category = lastCategory) {
+      const current = now();
+      lastActivityAt = current;
+      const label = category ? sanitizeLabel(category) : "";
+      if (label && label !== lastCategory && current - lastProgressAt >= 2_000) {
+        lastCategory = label;
+        lastProgressAt = current;
+        write(`relay: progress elapsed=${compactDuration(current - startedAt)} event=${label}\n`);
+      } else if (label) {
+        lastCategory = label;
+      }
+    },
+    event(event) {
+      eventCount += 1;
+      this.activity(eventCategory(event));
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      if (timer !== null) clearIntervalFn(timer);
+    },
+  };
 }
 
 function parseDuration(duration) {
@@ -187,10 +336,14 @@ function timestamp() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-function buildArgv(opts, brief) {
-  const argv = ["--output-format", "stream-json"];
+export function buildArgv(opts, brief) {
+  // --output-format only applies to Kimi's print mode, so --print must come
+  // with stream-json; without it Kimi CLI 1.49 rejects the flag pairing.
+  const argv = ["--print", "--output-format", "stream-json"];
   if (opts.model) argv.push("-m", opts.model);
-  if (opts.session) argv.push("--session", opts.session);
+  // Kimi parses --session as an optional-value option, so only the equals
+  // form binds the id unambiguously.
+  if (opts.session) argv.push(`--session=${opts.session}`);
   else if (opts.resumeLast) argv.push("--continue");
   for (const dir of opts.addDirs) argv.push("--add-dir", dir);
   // Use --prompt=<brief>, not a separate ["--prompt", brief] pair: the equals
@@ -240,6 +393,18 @@ function makeEventScanner(onObject) {
   };
 }
 
+export function extractText(content) {
+  // stream-json assistant content is either a plain string or an array of
+  // typed parts. Only text parts are user-visible - think/reasoning and tool
+  // payloads never belong in the final report.
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => part && part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
 function prepareRunDir(opts, brief) {
   const startedAt = new Date().toISOString();
   const outDir = opts.outDir || join(tmpdir(), "delegate-relay", `${basename(opts.cd) || "repo"}-${timestamp()}`);
@@ -258,7 +423,7 @@ function prepareRunDir(opts, brief) {
   return run;
 }
 
-function makeResultWriter(opts, version, run) {
+export function makeResultWriter(opts, runtime, run) {
   return (extra) => {
     const result = {
       schema: "delegate-relay.result.v1",
@@ -266,7 +431,8 @@ function makeResultWriter(opts, version, run) {
       workdir: opts.cd,
       model: opts.model,
       resumed: Boolean(opts.resumeLast || opts.session),
-      kimiVersion: version,
+      kimiVersion: runtime?.version ?? null,
+      kimiCommand: runtime?.command ?? null,
       startedAt: run.startedAt,
       finishedAt: new Date().toISOString(),
       briefPath: run.briefPath,
@@ -290,22 +456,34 @@ function reportUnavailable(writeResult, resultPath) {
     touchedFiles: null,
   });
   printSummary(result, resultPath);
-  process.stderr.write("relay: `kimi` not found on PATH. Install Kimi Code and run `kimi login`.\n");
+  process.stderr.write("relay: neither `kimi` nor `kimi-cli` could be executed from PATH. Install Kimi Code and run `kimi login` or `kimi-cli login`.\n");
   process.exit(127);
 }
 
-function dispatchToKimi(opts, brief, run, writeResult) {
-  const child = spawn("kimi", buildArgv(opts, brief), {
+function dispatchToKimi(opts, brief, runtime, run, writeResult) {
+  const child = spawn(runtime.command, buildArgv(opts, brief), {
     cwd: opts.cd,
+    env: runtime.env,
     stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  // Liveness reporting carries metadata only (elapsed time, pid, event count,
+  // event categories) - never prompt text, message content, or tool payloads.
+  // Its interval is independent of the watchdog: activity neither resets nor
+  // extends --timeout.
+  const reporter = createProgressReporter({
+    heartbeatMs: parseHeartbeatDuration(opts.heartbeat),
+    pid: child.pid,
   });
 
   let sessionId = null;
   const textChunks = [];
   const stderrTail = [];
   const scan = makeEventScanner((event) => {
-    if (event.role === "assistant" && typeof event.content === "string") {
-      textChunks.push(event.content);
+    reporter.event(event);
+    if (event.role === "assistant") {
+      const text = extractText(event.content);
+      if (text) textChunks.push(text);
     }
     if (event.role === "meta" && event.type === "session.resume_hint" && typeof event.session_id === "string") {
       sessionId = event.session_id;
@@ -319,11 +497,13 @@ function dispatchToKimi(opts, brief, run, writeResult) {
   const stderrDecoder = new StringDecoder("utf8");
 
   child.stdout.on("data", (chunk) => {
+    reporter.activity("stdout");
     appendFileSync(run.eventsPath, chunk);
     scan(stdoutDecoder.write(chunk));
   });
 
   child.stderr.on("data", (chunk) => {
+    reporter.activity("stderr");
     process.stderr.write(chunk);
     appendFileSync(run.stderrPath, chunk);
     const text = stderrDecoder.write(chunk);
@@ -360,6 +540,7 @@ function dispatchToKimi(opts, brief, run, writeResult) {
     settled = true;
     clearTimeout(watchdogTimer);
     if (sigkillTimer) clearTimeout(sigkillTimer);
+    reporter.stop();
     const result = writeResult({
       status: "failed",
       exitCode: 1,
@@ -379,6 +560,7 @@ function dispatchToKimi(opts, brief, run, writeResult) {
     settled = true;
     clearTimeout(watchdogTimer);
     if (sigkillTimer) clearTimeout(sigkillTimer);
+    reporter.stop();
     // A timed-out run is failed even if kimi handles SIGTERM by exiting 0 -
     // orchestrators key off status and the relay exit code.
     const succeeded = code === 0 && !watchdogFired;
@@ -413,20 +595,31 @@ function main() {
     fail(`brief is ${Math.round(briefBytes / 1024)}KB; kimi passes the prompt as a CLI argument, which the OS caps (~128KB on Linux). Trim it, or have kimi read large context from the workspace instead of inlining it.`);
   }
 
-  const version = kimiVersion();
+  // Validate an explicit --model against the first discovered Kimi config
+  // before any command resolution or artifact creation: a typo'd alias must
+  // fail here, not after Kimi starts a session.
+  if (opts.model) {
+    try {
+      validateModelAlias(opts.model);
+    } catch (err) {
+      fail(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  const runtime = resolveKimiCommand();
   const run = prepareRunDir(opts, brief);
-  const writeResult = makeResultWriter(opts, version, run);
-  if (!version) {
+  const writeResult = makeResultWriter(opts, runtime, run);
+  if (!runtime) {
     reportUnavailable(writeResult, run.resultPath);
     return;
   }
-  dispatchToKimi(opts, brief, run, writeResult);
+  dispatchToKimi(opts, brief, runtime, run, writeResult);
 }
 
 function printSummary(result, resultPath) {
   const lines = [];
   lines.push("");
-  lines.push(`relay: ${result.status} (exit ${result.exitCode}${result.signal ? `, killed by ${result.signal}` : ""})  ·  kimi ${result.kimiVersion ?? "?"}`);
+  lines.push(`relay: ${result.status} (exit ${result.exitCode}${result.signal ? `, killed by ${result.signal}` : ""})  ·  ${result.kimiCommand ?? "kimi"} ${result.kimiVersion ?? "?"}`);
   if (result.signal === "SIGKILL") lines.push("hint: the host killed the process (commonly the OOM killer or a supervisor timeout) — this is not a kimi error; check host memory and re-dispatch, or split the task into smaller briefs.");
   if (result.resumed) lines.push("mode: resumed an existing session");
   if (result.sessionId) lines.push(`session id (resume with: --session ${result.sessionId}): ${result.sessionId}`);
@@ -452,4 +645,5 @@ function printSummary(result, resultPath) {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-main();
+const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;
+if (invokedPath === import.meta.url) main();

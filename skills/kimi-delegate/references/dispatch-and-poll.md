@@ -6,14 +6,18 @@
 ## Before the first run
 
 ```bash
-command -v kimi
-kimi --version
-kimi login
+command -v kimi || command -v kimi-cli
+kimi --version   # or: kimi-cli --version
+kimi login   # or: kimi-cli login
 ```
 
-Install with `brew install kimi-code` on macOS/Linux or use a native installer from the
-[official Kimi Code documentation](https://moonshotai.github.io/kimi-code/en/). `kimi login` uses a
-device-code flow without opening the TUI; `/login` is also available inside the TUI.
+Follow the install script or npm instructions in the
+[official getting-started guide](https://moonshotai.github.io/kimi-code/en/guides/getting-started).
+`kimi login` and `kimi-cli login` use a
+device-code flow without opening the TUI; `/login` is also available inside the TUI. The relay
+probes `kimi` first and falls back to `kimi-cli`; either command satisfies the prerequisite. The
+child always runs with UTF-8 forced (`PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8`) while the rest of the
+caller's environment is preserved.
 
 ## Dispatching
 
@@ -27,20 +31,21 @@ node "<skill-dir>/scripts/relay.mjs" --brief brief.txt --cd /path/to/repo
 | --- | --- |
 | `--brief <file>` | Brief path. Omit it to read the brief from stdin. |
 | `--cd <dir>` | Working root and child process cwd (default: current directory). |
-| `--model <alias>` | Kimi model alias for this run (default: Kimi's own `default_model`). |
+| `--model <alias>` | Kimi model alias for this run (default: Kimi's own `default_model`). An explicit alias is validated against the first discovered config (`$KIMI_CODE_HOME/config.toml`, then `~/.kimi-code/config.toml`, then `~/.kimi/config.toml`) before dispatch; an unknown alias exits 2. |
 | `--session <id>` | Resume a specific Kimi session; send only the delta brief. |
 | `--resume-last` | Resume the most recent Kimi session for this cwd (`kimi --continue`); send only the delta brief. |
 | `--add-dir <dir>` | Add an extra workspace directory. Repeatable. Edits there are not reported in `touchedFiles`. |
 | `--timeout <dur>` | Relay watchdog (default: `30m`; h/m/s strings). Kimi has no timeout flag. |
+| `--heartbeat <dur>` | Liveness heartbeat on stderr (default: `30s`); pass `0` to disable. Never resets or extends `--timeout`. |
 | `--out-dir <dir>` | Artifact directory (default: a fresh directory under the system temp dir). |
 | `-h`, `--help` | Print the relay's header help. |
 
 `--session` and `--resume-last` are mutually exclusive. The child cwd pins the primary workspace;
 `--add-dir` adds extra workspaces only.
 
-Headless `-p` mode always uses Kimi's auto permission mode. Kimi rejects `--prompt` combined with
-`--yolo`, `--auto`, or `--plan`, so the relay passes no autonomy flags and has no `--read-only` or
-`--full-access` option. Inspect `touchedFiles` and the diff after every run.
+Headless `--print` mode always uses Kimi's auto permission mode and never asks for approval, so
+the relay passes no additional autonomy flag and has no `--read-only` or `--full-access` option.
+Inspect `touchedFiles` and the diff after every run.
 
 ## Artifacts and result fields
 
@@ -57,10 +62,12 @@ inside the worktree can make the artifacts appear there:
 
 - `schema`, `tool` (`"kimi"`), `status` (`completed` | `failed` | `kimi_unavailable`), `exitCode`, and
   `signal` (`null` unless the child died on a signal).
-- `workdir`, `model` (the model alias or `null`), `resumed`, `kimiVersion`, `sessionId`, `startedAt`,
+- `workdir`, `model` (the model alias or `null`), `resumed`, `kimiVersion`, `kimiCommand` (the
+  resolved executable, `kimi` or `kimi-cli`; `null` when unavailable), `sessionId`, `startedAt`,
   and `finishedAt`.
 - `briefPath`, `finalPath`, `eventsPath`, and `stderrPath`.
-- `finalMessage` - assistant `content` strings joined with `"\n\n"`; tool calls and tool results are
+- `finalMessage` - the assistant's visible text (string content, or the `text` parts of content
+  arrays) joined with `"\n\n"`; reasoning (`think`) parts, tool calls, and tool results are
   excluded.
 - `touchedFiles` - `git status --porcelain` lines for the **final working tree under `--cd` only**,
   not an attribution of Kimi's edits: anything already dirty before dispatch shows up too, and edits
@@ -77,13 +84,17 @@ Kimi's stream carries no token usage, so `result.json` has no `usage` field.
 The helper blocks. Use the orchestrator's background-command facility, or background it in a shell and
 poll for `result.json`. The run is done only when the process exits and the file contains a `status`.
 
-A pre-run usage error exits 2 and writes no result. A missing `kimi` exits 127 and writes
-`status: "kimi_unavailable"`.
+A pre-run usage error exits 2 and writes no result. If neither `kimi` nor `kimi-cli` is executable,
+the relay exits 127 and writes `status: "kimi_unavailable"`.
 
 ## When a run misbehaves
 
-- **`status: "kimi_unavailable"` (exit 127):** install the native Kimi Code CLI, authenticate with
-  `kimi login`, and re-dispatch.
+Heartbeat lines contain only elapsed time, child PID, parsed-event count, idle time, and the last
+event category. They never contain brief or model output. A heartbeat does not extend or reset
+`--timeout`; the watchdog remains authoritative.
+
+- **`status: "kimi_unavailable"` (exit 127):** install the Kimi Code CLI, authenticate with
+  `kimi login` or `kimi-cli login`, and re-dispatch.
 - **`status: "failed"`:** read `stderrTail`, `stderrPath`, and the tail of `events.jsonl`. A common
   cause is an unconfigured model alias: `error: failed to run prompt: config.invalid: Model "<x>" is not configured in config.toml…`
 - **`status: "failed"` with `signal: "SIGKILL"`:** the host killed the process, commonly through the
@@ -100,13 +111,14 @@ A pre-run usage error exits 2 and writes no result. A missing `kimi` exits 127 a
 The argv is equivalent to:
 
 ```bash
-kimi --output-format stream-json [--model <alias>] [--session <id> | --continue] \
+kimi|kimi-cli --print --output-format stream-json [--model <alias>] [--session=<id> | --continue] \
   [--add-dir <dir> ...] --prompt=<brief>
 ```
 
 The prompt rides argv and is visible in the host process list. The relay rejects briefs over 120 KB
-before launch because the OS caps a single argument. It spawns the native `kimi` binary directly with
-the selected `--cd` as cwd; no shell or Kimi timeout flag is involved.
+before launch because the OS caps a single argument. It probes `kimi` first, falls back to
+`kimi-cli`, and spawns the resolved executable directly with the selected `--cd` as cwd; no shell or
+Kimi timeout flag is involved.
 
 ## The commit boundary
 
