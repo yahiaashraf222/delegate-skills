@@ -192,6 +192,43 @@ export function resolveKimiCommand(probe = defaultVersionProbe, baseEnv = proces
   return null;
 }
 
+export function kimiConfigCandidates(env = process.env, home = homedir()) {
+  const paths = [];
+  if (env.KIMI_CODE_HOME) paths.push(join(env.KIMI_CODE_HOME, "config.toml"));
+  paths.push(join(home, ".kimi-code", "config.toml"));
+  paths.push(join(home, ".kimi", "config.toml"));
+  return [...new Set(paths)];
+}
+
+export function findKimiConfig(env = process.env, home = homedir(), fileExists = existsSync) {
+  return kimiConfigCandidates(env, home).find((path) => fileExists(path)) ?? null;
+}
+
+export function parseModelAliases(toml) {
+  const aliases = [];
+  const table = /^\s*\[models\.(?:"((?:\\.|[^"\\])*)"|([A-Za-z0-9_-]+))\]\s*(?:#.*)?$/gm;
+  for (const match of toml.matchAll(table)) aliases.push(match[1] ?? match[2]);
+  return aliases;
+}
+
+export function validateModelAlias(alias, {
+  env = process.env,
+  home = homedir(),
+  readFile = readFileSync,
+  fileExists = existsSync,
+} = {}) {
+  const configPath = findKimiConfig(env, home, fileExists);
+  if (!configPath) {
+    throw new Error(`cannot validate model alias "${alias}": no Kimi config.toml found`);
+  }
+  const aliases = parseModelAliases(readFile(configPath, "utf8"));
+  if (!aliases.includes(alias)) {
+    const choices = aliases.length ? aliases.join(", ") : "(none found)";
+    throw new Error(`model alias "${alias}" is not configured in ${configPath}; available aliases: ${choices}`);
+  }
+  return { configPath, aliases };
+}
+
 function parseDuration(duration) {
   // Whole-string match: "1mtypo" must be rejected, not read as one minute.
   const match = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(duration);
@@ -439,6 +476,17 @@ function main() {
   const MAX_BRIEF_BYTES = 120 * 1024;
   if (briefBytes > MAX_BRIEF_BYTES) {
     fail(`brief is ${Math.round(briefBytes / 1024)}KB; kimi passes the prompt as a CLI argument, which the OS caps (~128KB on Linux). Trim it, or have kimi read large context from the workspace instead of inlining it.`);
+  }
+
+  // Validate an explicit --model against the first discovered Kimi config
+  // before any command resolution or artifact creation: a typo'd alias must
+  // fail here, not after Kimi starts a session.
+  if (opts.model) {
+    try {
+      validateModelAlias(opts.model);
+    } catch (err) {
+      fail(err instanceof Error ? err.message : String(err));
+    }
   }
 
   const version = kimiVersion();
