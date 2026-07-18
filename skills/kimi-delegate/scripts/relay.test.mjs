@@ -4,12 +4,15 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildArgv,
   createProgressReporter,
   eventCategory,
+  extractText,
   findKimiConfig,
   formatHeartbeat,
   kimiConfigCandidates,
   makeKimiEnv,
+  makeResultWriter,
   parseHeartbeatDuration,
   parseModelAliases,
   resolveKimiCommand,
@@ -196,4 +199,83 @@ test("createProgressReporter writes single-line bounded progress for malicious c
     assert.ok(!line.includes("INJECT: pwned"));
     assert.ok(line.length <= 120);
   }
+});
+
+test("makeResultWriter records the resolved Kimi command additively", () => {
+  const root = mkdtempSync(join(tmpdir(), "kimi-result-"));
+  const run = {
+    startedAt: "2026-07-18T00:00:00.000Z",
+    briefPath: join(root, "brief.txt"),
+    finalPath: join(root, "final.txt"),
+    eventsPath: join(root, "events.jsonl"),
+    stderrPath: join(root, "stderr.txt"),
+    resultPath: join(root, "result.json"),
+  };
+  writeFileSync(run.briefPath, "brief", "utf8");
+  writeFileSync(run.eventsPath, "", "utf8");
+  writeFileSync(run.stderrPath, "", "utf8");
+
+  const writeResult = makeResultWriter(
+    { cd: root, model: "kimi-code/k3", resumeLast: false, session: null },
+    { command: "kimi-cli", version: "kimi, version 1.49.0", env: {} },
+    run,
+  );
+  const result = writeResult({ status: "completed", exitCode: 0, signal: null });
+
+  assert.equal(result.kimiCommand, "kimi-cli");
+  assert.equal(result.kimiVersion, "kimi, version 1.49.0");
+  assert.equal(result.schema, "delegate-relay.result.v1");
+});
+
+test("buildArgv pairs --print with stream-json output", () => {
+  const argv = buildArgv(
+    { model: "kimi-code/k3", session: null, resumeLast: false, addDirs: [] },
+    "brief text",
+  );
+  assert.deepEqual(argv.slice(0, 3), ["--print", "--output-format", "stream-json"]);
+  assert.ok(argv.includes("--prompt=brief text"));
+});
+
+test("extractText returns string content unchanged", () => {
+  assert.equal(extractText("hello world"), "hello world");
+  assert.equal(extractText(""), "");
+  assert.equal(extractText(null), "");
+  assert.equal(extractText(undefined), "");
+  assert.equal(extractText(42), "");
+});
+
+test("extractText joins text parts from a content array", () => {
+  const content = [
+    { type: "text", text: "Hello " },
+    { type: "text", text: "world" },
+  ];
+  assert.equal(extractText(content), "Hello world");
+});
+
+test("extractText ignores think and tool parts", () => {
+  const content = [
+    { type: "think", think: "secret reasoning" },
+    { type: "tool_call", name: "Shell", arguments: "secret args" },
+    { type: "text", text: "visible" },
+    { type: "tool_result", content: "secret tool output" },
+  ];
+  const text = extractText(content);
+  assert.equal(text, "visible");
+  assert.ok(!text.includes("secret"));
+});
+
+test("buildArgv passes --session in equals form and keeps --continue", () => {
+  const withSession = buildArgv(
+    { model: null, session: "abc-123", resumeLast: false, addDirs: [] },
+    "brief",
+  );
+  assert.ok(withSession.includes("--session=abc-123"));
+  assert.ok(!withSession.includes("--session"));
+
+  const resumed = buildArgv(
+    { model: null, session: null, resumeLast: true, addDirs: [] },
+    "brief",
+  );
+  assert.ok(resumed.includes("--continue"));
+  assert.ok(!resumed.some((arg) => arg.startsWith("--session")));
 });
