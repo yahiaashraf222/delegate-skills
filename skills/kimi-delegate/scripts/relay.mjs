@@ -45,6 +45,8 @@
  *   --add-dir <dir>         Add an extra workspace directory. Repeatable.
  *   --timeout <dur>         Relay-side watchdog (default: 30m). Kimi has no
  *                           timeout flag; durations use h/m/s strings.
+ *   --heartbeat <dur>       Liveness heartbeat on stderr (default: 30s); pass
+ *                           0 to disable. It never resets or extends --timeout.
  *   --out-dir <dir>         Where to write run artifacts (default: a fresh dir
  *                           under the system temp dir).
  *   -h, --help              Show this help.
@@ -70,6 +72,7 @@ import { StringDecoder } from "node:string_decoder";
 import { pathToFileURL } from "node:url";
 
 const DEFAULT_TIMEOUT = "30m";
+const DEFAULT_HEARTBEAT = "30s";
 
 function fail(message, code = 2) {
   process.stderr.write(`relay: ${message}\n`);
@@ -85,6 +88,7 @@ function parseArgs(argv) {
     resumeLast: false,
     addDirs: [],
     timeout: DEFAULT_TIMEOUT,
+    heartbeat: DEFAULT_HEARTBEAT,
     outDir: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -108,6 +112,7 @@ function parseArgs(argv) {
       case "--resume-last": opts.resumeLast = true; break;
       case "--add-dir": opts.addDirs.push(next()); break;
       case "--timeout": opts.timeout = next(); break;
+      case "--heartbeat": opts.heartbeat = next(); break;
       case "--out-dir": opts.outDir = resolve(next()); break;
       default:
         fail(`unknown option: ${arg}`);
@@ -124,6 +129,9 @@ function parseArgs(argv) {
   // --timeout must fail loudly here - a silent 30m fallback would be wrong.
   if (parseDuration(opts.timeout) === null) {
     fail(`--timeout "${opts.timeout}" is not a duration; use h/m/s strings like 30m, 90s, or 1h30m`);
+  }
+  if (parseHeartbeatDuration(opts.heartbeat) === null) {
+    fail(`--heartbeat "${opts.heartbeat}" is not a duration; use 30s, 2m, or 0 to disable it`);
   }
   return opts;
 }
@@ -227,6 +235,89 @@ export function validateModelAlias(alias, {
     throw new Error(`model alias "${alias}" is not configured in ${configPath}; available aliases: ${choices}`);
   }
   return { configPath, aliases };
+}
+
+export function parseHeartbeatDuration(value) {
+  if (value === "0") return 0;
+  return parseDuration(value);
+}
+
+function compactDuration(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes ? `${minutes}m${remainder ? `${remainder}s` : ""}` : `${remainder}s`;
+}
+
+function sanitizeLabel(value) {
+  // Progress metadata must stay single-line and bounded: keep only printable
+  // non-space ASCII so a malformed stream event cannot inject newlines,
+  // control characters, or unbounded text into progress output.
+  return String(value ?? "").replace(/[^\x21-\x7E]/g, "").slice(0, 40);
+}
+
+export function eventCategory(event) {
+  const role = (typeof event?.role === "string" && sanitizeLabel(event.role)) || "event";
+  const raw = typeof event?.type === "string"
+    ? event.type
+    : typeof event?.name === "string" ? event.name : null;
+  const detail = raw === null ? "" : sanitizeLabel(raw);
+  return detail ? `${role}/${detail}` : role;
+}
+
+export function formatHeartbeat({ elapsedMs, pid, eventCount, idleMs, lastCategory }) {
+  const last = (lastCategory && sanitizeLabel(lastCategory)) || "none";
+  return `relay: heartbeat elapsed=${compactDuration(elapsedMs)} pid=${pid ?? "?"} events=${eventCount} idle=${compactDuration(idleMs)} last=${last}\n`;
+}
+
+export function createProgressReporter({
+  heartbeatMs,
+  pid,
+  write = (line) => process.stderr.write(line),
+  now = Date.now,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+}) {
+  const startedAt = now();
+  let lastActivityAt = startedAt;
+  let lastProgressAt = Number.NEGATIVE_INFINITY;
+  let lastCategory = null;
+  let eventCount = 0;
+  let stopped = false;
+  const timer = heartbeatMs > 0 ? setIntervalFn(() => {
+    const current = now();
+    write(formatHeartbeat({
+      elapsedMs: current - startedAt,
+      pid,
+      eventCount,
+      idleMs: current - lastActivityAt,
+      lastCategory,
+    }));
+  }, heartbeatMs) : null;
+
+  return {
+    activity(category = lastCategory) {
+      const current = now();
+      lastActivityAt = current;
+      const label = category ? sanitizeLabel(category) : "";
+      if (label && label !== lastCategory && current - lastProgressAt >= 2_000) {
+        lastCategory = label;
+        lastProgressAt = current;
+        write(`relay: progress elapsed=${compactDuration(current - startedAt)} event=${label}\n`);
+      } else if (label) {
+        lastCategory = label;
+      }
+    },
+    event(event) {
+      eventCount += 1;
+      this.activity(eventCategory(event));
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      if (timer !== null) clearIntervalFn(timer);
+    },
+  };
 }
 
 function parseDuration(duration) {
@@ -365,10 +456,20 @@ function dispatchToKimi(opts, brief, run, writeResult) {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  // Liveness reporting carries metadata only (elapsed time, pid, event count,
+  // event categories) - never prompt text, message content, or tool payloads.
+  // Its interval is independent of the watchdog: activity neither resets nor
+  // extends --timeout.
+  const reporter = createProgressReporter({
+    heartbeatMs: parseHeartbeatDuration(opts.heartbeat),
+    pid: child.pid,
+  });
+
   let sessionId = null;
   const textChunks = [];
   const stderrTail = [];
   const scan = makeEventScanner((event) => {
+    reporter.event(event);
     if (event.role === "assistant" && typeof event.content === "string") {
       textChunks.push(event.content);
     }
@@ -384,11 +485,13 @@ function dispatchToKimi(opts, brief, run, writeResult) {
   const stderrDecoder = new StringDecoder("utf8");
 
   child.stdout.on("data", (chunk) => {
+    reporter.activity("stdout");
     appendFileSync(run.eventsPath, chunk);
     scan(stdoutDecoder.write(chunk));
   });
 
   child.stderr.on("data", (chunk) => {
+    reporter.activity("stderr");
     process.stderr.write(chunk);
     appendFileSync(run.stderrPath, chunk);
     const text = stderrDecoder.write(chunk);
@@ -425,6 +528,7 @@ function dispatchToKimi(opts, brief, run, writeResult) {
     settled = true;
     clearTimeout(watchdogTimer);
     if (sigkillTimer) clearTimeout(sigkillTimer);
+    reporter.stop();
     const result = writeResult({
       status: "failed",
       exitCode: 1,
@@ -444,6 +548,7 @@ function dispatchToKimi(opts, brief, run, writeResult) {
     settled = true;
     clearTimeout(watchdogTimer);
     if (sigkillTimer) clearTimeout(sigkillTimer);
+    reporter.stop();
     // A timed-out run is failed even if kimi handles SIGTERM by exiting 0 -
     // orchestrators key off status and the relay exit code.
     const succeeded = code === 0 && !watchdogFired;

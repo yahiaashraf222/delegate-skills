@@ -4,9 +4,13 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  createProgressReporter,
+  eventCategory,
   findKimiConfig,
+  formatHeartbeat,
   kimiConfigCandidates,
   makeKimiEnv,
+  parseHeartbeatDuration,
   parseModelAliases,
   resolveKimiCommand,
   validateModelAlias,
@@ -97,4 +101,99 @@ test("validateModelAlias rejects an unknown alias and lists safe choices", () =>
     () => validateModelAlias("k3", { env: {}, home: root }),
     /model alias "k3" is not configured.*kimi-code\/k3/s,
   );
+});
+
+test("parseHeartbeatDuration accepts durations and literal zero", () => {
+  assert.equal(parseHeartbeatDuration("30s"), 30_000);
+  assert.equal(parseHeartbeatDuration("1m30s"), 90_000);
+  assert.equal(parseHeartbeatDuration("0"), 0);
+  assert.equal(parseHeartbeatDuration("0s"), 0);
+  assert.equal(parseHeartbeatDuration("bad"), null);
+});
+
+test("eventCategory uses metadata only", () => {
+  assert.equal(eventCategory({ role: "assistant", type: "message", content: "secret" }), "assistant/message");
+  assert.equal(eventCategory({ role: "tool", name: "Shell", content: "secret" }), "tool/Shell");
+});
+
+test("formatHeartbeat contains liveness metadata but no content", () => {
+  const line = formatHeartbeat({
+    elapsedMs: 420_000,
+    pid: 1234,
+    eventCount: 8,
+    idleMs: 90_000,
+    lastCategory: "assistant/message",
+  });
+  assert.match(line, /elapsed=7m/);
+  assert.match(line, /pid=1234/);
+  assert.match(line, /events=8/);
+  assert.match(line, /idle=1m30s/);
+  assert.doesNotMatch(line, /secret/);
+});
+
+test("createProgressReporter clears its heartbeat timer exactly once", () => {
+  const cleared = [];
+  let intervalCallback;
+  const writes = [];
+  const reporter = createProgressReporter({
+    heartbeatMs: 30_000,
+    pid: 1234,
+    write: (line) => writes.push(line),
+    now: () => 100_000,
+    setIntervalFn: (callback) => { intervalCallback = callback; return 77; },
+    clearIntervalFn: (id) => cleared.push(id),
+  });
+  intervalCallback();
+  reporter.stop();
+  reporter.stop();
+  assert.equal(writes.length, 1);
+  assert.deepEqual(cleared, [77]);
+});
+
+test("eventCategory sanitizes control characters and bounds length", () => {
+  const category = eventCategory({
+    role: "tool\r\nassistant",
+    name: `Shell\nINJECT: pwned ${"x".repeat(200)}`,
+  });
+  assert.match(category, /^[\x21-\x7E]+$/);
+  assert.ok(category.length <= 81);
+  assert.ok(!category.includes("INJECT: pwned"));
+  assert.equal(category, `toolassistant/ShellINJECT:pwned${"x".repeat(23)}`);
+  assert.equal(eventCategory({ role: "\n\r", name: "\t" }), "event");
+});
+
+test("formatHeartbeat stays single-line with a malicious category", () => {
+  const line = formatHeartbeat({
+    elapsedMs: 1_000,
+    pid: 7,
+    eventCount: 1,
+    idleMs: 0,
+    lastCategory: "tool/Shell\nINJECT: pwned\r\nrelay: fake heartbeat",
+  });
+  assert.equal(line.split("\n").length, 2);
+  assert.ok(!line.includes("INJECT: pwned"));
+  assert.ok(!line.includes("fake heartbeat"));
+  assert.match(line, /last=\S{1,40}\n$/);
+});
+
+test("createProgressReporter writes single-line bounded progress for malicious categories", () => {
+  const writes = [];
+  // Deterministic clock: creation and first activity share a timestamp, the
+  // second event lands past the 2000ms category-change throttle.
+  const timestamps = [100_000, 100_000, 103_000];
+  const reporter = createProgressReporter({
+    heartbeatMs: 0,
+    pid: 1,
+    write: (line) => writes.push(line),
+    now: () => timestamps.shift() ?? 103_000,
+  });
+  reporter.activity("tool/Shell\nINJECT: pwned");
+  reporter.event({ role: "assistant\n", type: "message\r\nINJECT: pwned" });
+  reporter.stop();
+  assert.equal(writes.length, 2);
+  for (const line of writes) {
+    assert.equal(line.split("\n").length, 2);
+    assert.ok(!line.includes("INJECT: pwned"));
+    assert.ok(line.length <= 120);
+  }
 });
